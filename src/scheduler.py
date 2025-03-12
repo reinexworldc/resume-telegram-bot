@@ -5,7 +5,7 @@ import logging
 from aiogram import Bot
 import os
 from dotenv import load_dotenv
-from database import get_unsent_messages, mark_message_as_sent
+from .database import get_unsent_messages, mark_message_as_sent
 
 load_dotenv()
 
