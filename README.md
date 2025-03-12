@@ -1,64 +1,117 @@
-# Telegram Bot с отложенной отправкой сообщений
+# Telegram Bot для отправки резюме в канал
 
-Этот бот принимает сообщения от пользователей, сохраняет их в базе данных PostgreSQL и отправляет в указанный Telegram канал каждые 8 часов.
+Этот бот позволяет пользователям отправлять резюме, которые после проверки с помощью DeepSeek AI будут регулярно публиковаться в указанном Telegram-канале.
+
+## Функциональность
+
+- Проверка резюме на соответствие правилам с использованием DeepSeek AI
+- Анализ орфографии, грамматики и структуры резюме
+- Автоматическая отправка одобренных резюме в канал каждые 8 часов
+- Уведомления пользователей о статусе их резюме
+- Хранение резюме в PostgreSQL
+- Использование RabbitMQ для очереди сообщений
 
 ## Требования
 
-- Python 3.7+
+- Python 3.8+
 - PostgreSQL
-- Telegram Bot Token (от @BotFather)
-- Telegram канал, где бот является администратором
+- RabbitMQ
+- Доступ к API DeepSeek AI
 
 ## Установка
 
 1. Клонируйте репозиторий:
 ```bash
-git clone <repository-url>
-cd <repository-directory>
+git clone https://github.com/yourusername/telegram-channel-bot.git
+cd telegram-channel-bot
 ```
 
 2. Создайте виртуальное окружение и установите зависимости:
 ```bash
-python -m venv .venv
-source .venv/bin/activate  # для Linux/Mac
-# или
-.venv\Scripts\activate  # для Windows
+python -m venv venv
+source venv/bin/activate  # На Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-3. Создайте базу данных в PostgreSQL:
+3. Создайте файл `.env` в корневой директории проекта со следующими переменными:
+```
+BOT_TOKEN='ваш_токен_бота'
+CHANNEL_ID='@ваш_канал' или '-100xxxxxxxxxx' для приватных каналов
+DATABASE_URL='postgresql+asyncpg://username:password@localhost:5432/database_name'
+RABBITMQ_URL='amqp://username:password@localhost:5672/'
+DEEPSEEK_API_KEY='ваш_ключ_api_deepseek'
+DEEPSEEK_MODEL='deepseek-chat'
+DEEPSEEK_API_URL='https://api.deepseek.com/v1/chat/completions'
+```
+
+4. Создайте базу данных в PostgreSQL:
 ```bash
-createdb telegram_bot
+createdb database_name
 ```
 
-4. Настройте файл `.env` с вашими параметрами:
-```
-BOT_TOKEN=your_bot_token_here
-CHANNEL_ID=your_channel_id_here
-DATABASE_URL=postgresql://username:password@localhost/telegram_bot
+5. Инициализируйте базу данных:
+```bash
+python src/migrate_db.py
 ```
 
-## Запуск бота
+## Запуск
 
+1. Запустите RabbitMQ, если он еще не запущен:
+```bash
+# На Ubuntu/Debian
+sudo service rabbitmq-server start
+
+# На macOS с Homebrew
+brew services start rabbitmq
+```
+
+2. Запустите бота:
 ```bash
 python src/bot.py
 ```
 
+## Миграция базы данных
+
+Если вы обновили код бота и структура базы данных изменилась, вы можете выполнить миграцию:
+
+1. Проверьте текущую структуру базы данных:
+```bash
+python src/migrate_db.py --check
+```
+
+2. Выполните миграцию (это удалит все данные!):
+```bash
+python src/migrate_db.py
+```
+
+## Команды бота
+
+- `/start` - Начать работу с ботом
+- `/status` - Проверить статус вашего резюме
+- `/help` - Получить помощь по использованию бота
+
+## Требования к резюме
+
+- Резюме должно содержать хэштег #резюме
+- Резюме должно быть грамотно составлено (проверяется с помощью DeepSeek AI)
+- Резюме не должно содержать запрещенные слова и спам-символы
+
 ## Структура проекта
 
-- `src/bot.py` - основной файл бота
-- `src/database.py` - модуль для работы с базой данных
-- `src/scheduler.py` - модуль планировщика для отправки сообщений
+```
+telegram-channel-bot/
+├── src/
+│   ├── bot.py         # Основной файл бота
+│   ├── models.py      # Модели базы данных
+│   ├── config.py      # Конфигурация
+│   ├── ai_checker.py  # Модуль для проверки резюме с помощью DeepSeek AI
+│   ├── safe_migrate.py # Безопасная миграция базы данных
+│   └── migrate_db.py  # Скрипт миграции базы данных
+├── .env               # Переменные окружения
+├── requirements.txt   # Зависимости
+└── README.md          # Документация
+```
 
-## Как это работает
+## Лицензия
 
-1. Пользователь отправляет сообщение боту
-2. Бот сохраняет сообщение в базе данных PostgreSQL с именем пользователя
-3. Планировщик каждые 8 часов проверяет наличие неотправленных сообщений
-4. Если есть неотправленные сообщения, они отправляются в канал и помечаются как отправленные
-
-## Примечания
-
-- Бот должен быть администратором канала для отправки сообщений
-- ID канала должен начинаться с `-100` для публичных каналов
-- Для тестирования можно изменить интервал отправки в файле `src/scheduler.py` 
+MIT 

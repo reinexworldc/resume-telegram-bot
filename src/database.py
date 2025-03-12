@@ -8,14 +8,11 @@ load_dotenv()
 
 DATABASE_URL = os.getenv('DATABASE_URL', 'postgresql://postgres:postgres@localhost/telegram_bot')
 
-# Create SQLAlchemy engine
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
-# Create base class for models
 Base = declarative_base()
 
-# Define message model
 class Message(Base):
     __tablename__ = "messages"
 
@@ -25,11 +22,9 @@ class Message(Base):
     created_at = Column(DateTime, default=datetime.now)
     sent = Column(Integer, default=0)  # 0 - not sent, 1 - sent
 
-# Create tables in database
 def create_tables():
     Base.metadata.create_all(bind=engine)
 
-# Get database session
 def get_db():
     db = SessionLocal()
     try:
@@ -37,7 +32,6 @@ def get_db():
     finally:
         db.close()
 
-# Get unsent messages
 def get_unsent_messages():
     db = get_db()
     try:
@@ -46,7 +40,6 @@ def get_unsent_messages():
         db.close()
         raise e
 
-# Mark message as sent
 def mark_message_as_sent(message_id):
     db = get_db()
     try:
