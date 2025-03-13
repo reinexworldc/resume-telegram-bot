@@ -1,7 +1,8 @@
 import asyncio
 import logging
-import aio_pika
 import random
+import sys
+import os
 from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
@@ -10,23 +11,33 @@ from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.future import select
 
+# Добавляем родительскую директорию в sys.path для корректного импорта
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 # Пытаемся импортировать как модуль, если не получается - используем относительные пути
 try:
     from src.models import Base, UserMessage
     from src.config import (
-        BOT_TOKEN, CHANNEL_ID, DATABASE_URL, RABBITMQ_URL,
+        BOT_TOKEN, CHANNEL_ID, DATABASE_URL,
         MIN_MESSAGE_LENGTH, FORBIDDEN_WORDS, SPAM_SYMBOLS,
         MESSAGE_INTERVAL_HOURS, LOG_LEVEL
     )
-    from src.ai_checker import check_resume_with_ai
+    from src.ai_checker import check_resume_locally
+    from src.safe_migrate import safe_migrate
 except ImportError:
-    from models import Base, UserMessage
-    from config import (
-        BOT_TOKEN, CHANNEL_ID, DATABASE_URL, RABBITMQ_URL,
-        MIN_MESSAGE_LENGTH, FORBIDDEN_WORDS, SPAM_SYMBOLS,
-        MESSAGE_INTERVAL_HOURS, LOG_LEVEL
-    )
-    from ai_checker import check_resume_with_ai
+    try:
+        from models import Base, UserMessage
+        from config import (
+            BOT_TOKEN, CHANNEL_ID, DATABASE_URL,
+            MIN_MESSAGE_LENGTH, FORBIDDEN_WORDS, SPAM_SYMBOLS,
+            MESSAGE_INTERVAL_HOURS, LOG_LEVEL
+        )
+        from ai_checker import check_resume_locally
+        from safe_migrate import safe_migrate
+    except ImportError as e:
+        print(f"Ошибка импорта модулей: {e}")
+        print("Убедитесь, что вы запускаете бота из корневой директории проекта или из директории src")
+        sys.exit(1)
 
 # Настройка логирования
 logging.basicConfig(level=getattr(logging, LOG_LEVEL))
@@ -44,6 +55,9 @@ engine = create_async_engine(DATABASE_URL)
 async_session = sessionmaker(
     engine, class_=AsyncSession, expire_on_commit=False
 )
+
+# Глобальная очередь сообщений
+queue = None
 
 # Создание таблиц при запуске
 async def init_db():
@@ -74,129 +88,141 @@ async def init_db():
         logger.error(f"Ошибка при инициализации базы данных: {e}")
         raise
 
-# Отправка в очередь RabbitMQ
-async def send_to_queue(username: str, message: str):
-    try:
-        connection = await aio_pika.connect_robust(RABBITMQ_URL)
-        async with connection:
-            channel = await connection.channel()
-            # Создаем очередь с параметром durable=True для сохранения сообщений при перезапуске
-            queue = await channel.declare_queue('message_check', durable=True)
-            
-            # Создаем сообщение с параметром delivery_mode=2 для сохранения в RabbitMQ
-            # Добавляем timestamp для отслеживания актуальности сообщения
-            timestamp = datetime.now().timestamp()
-            await channel.default_exchange.publish(
-                aio_pika.Message(
-                    body=f"{username}:{message}:{timestamp}".encode(),
-                    delivery_mode=aio_pika.DeliveryMode.PERSISTENT
-                ),
-                routing_key=queue.name
-            )
-            logger.info(f"Сообщение от {username} успешно отправлено в очередь (timestamp: {timestamp})")
-    except Exception as e:
-        logger.error(f"Ошибка при отправке сообщения в очередь: {e}")
-        # Повторно выбрасываем исключение, чтобы уведомить пользователя
-        raise
-
-# Расширенная проверка сообщения
-async def check_message_with_neural_net(message: str) -> tuple[bool, str]:
+async def send_to_queue(username: str, message: str) -> None:
     """
-    Проверяет сообщение с помощью нейронной сети DeepSeek AI.
+    Отправляет сообщение на проверку.
+    В данной реализации проверка выполняется напрямую, без использования очереди.
     
     Args:
+        username: Имя пользователя
         message: Текст сообщения для проверки
-        
-    Returns:
-        tuple: (одобрено, отчет о проверке)
     """
+    logger.info(f"Отправка сообщения пользователя {username} на проверку")
+    
+    # Запускаем проверку сообщения асинхронно
+    asyncio.create_task(check_message_with_neural_net(username, message))
+
+# Расширенная проверка сообщения
+async def check_message_with_neural_net(username: str, message: str) -> None:
+    """
+    Проверяет сообщение с помощью локальной проверки.
+    Обновляет статус сообщения в базе данных и отправляет уведомление пользователю.
+    
+    Args:
+        username: Имя пользователя
+        message: Текст сообщения для проверки
+    """
+    logger.info(f"Проверка сообщения пользователя {username}")
+    
     try:
-        # Проверка на минимальную длину
-        if len(message) < MIN_MESSAGE_LENGTH:
-            return False, f"❌ Сообщение слишком короткое. Минимальная длина - {MIN_MESSAGE_LENGTH} символов."
+        # Используем локальную проверку резюме
+        is_approved, check_result = check_resume_locally(message)
         
-        # Проверка на запрещенные слова
-        forbidden_words = FORBIDDEN_WORDS
-        for word in forbidden_words:
-            if word.lower() in message.lower():
-                return False, f"❌ Сообщение содержит запрещенное слово: {word}"
+        async with async_session() as session:
+            async with session.begin():
+                # Получаем сообщение пользователя из базы данных
+                stmt = select(UserMessage).where(UserMessage.username == username)
+                result = await session.execute(stmt)
+                user_message = result.scalar_one_or_none()
+                
+                if not user_message:
+                    logger.warning(f"Сообщение пользователя {username} не найдено в базе данных")
+                    return
+                
+                # Проверяем, что сообщение не было обновлено после отправки на проверку
+                if user_message.message != message:
+                    logger.info(f"Сообщение пользователя {username} было обновлено после отправки на проверку. Игнорируем результат проверки.")
+                    return
+                
+                # Обновляем статус сообщения
+                user_message.approved = 1 if is_approved else -1
+                user_message.check_result = check_result
+                
+                await session.commit()
         
-        # Проверка на спам-символы
-        spam_symbols = SPAM_SYMBOLS
-        for symbol in spam_symbols:
-            if symbol in message:
-                return False, f"❌ Сообщение содержит спам-символы: {symbol}"
+        # Отправляем уведомление пользователю
+        status_text = "Одобрено" if is_approved else "Отклонено"
+        notification_text = f"Статус вашего резюме: {status_text}\n\n{check_result}"
         
-        # Проверка с помощью DeepSeek AI
-        return await check_resume_with_ai(message)
+        if is_approved:
+            notification_text += f"\n\nВаше резюме будет отправляться в канал каждые {MESSAGE_INTERVAL_HOURS} часов."
+        else:
+            notification_text += "\n\nПожалуйста, исправьте указанные проблемы и отправьте резюме снова."
+        
+        try:
+            await bot.send_message(chat_id=f"@{username}", text=notification_text)
+            logger.info(f"Уведомление отправлено пользователю {username}")
+        except Exception as e:
+            logger.error(f"Ошибка при отправке уведомления пользователю {username}: {e}")
+            # Если не удалось отправить сообщение напрямую, сохраняем результат проверки
+            # Пользователь сможет увидеть его через команду /status
+            logger.info(f"Результат проверки сохранен в базе данных для пользователя {username}")
     
     except Exception as e:
-        logger.error(f"Ошибка при проверке сообщения: {e}")
-        # В случае ошибки лучше отклонить сообщение
-        return False, f"❌ Произошла ошибка при проверке: {str(e)}"
-
-# Consumer для RabbitMQ
-async def consumer():
-    try:
-        # Подключение к RabbitMQ
-        connection = await aio_pika.connect_robust(RABBITMQ_URL)
-        async with connection:
-            # Создание канала
-            channel = await connection.channel()
-            # Объявление очереди с параметром durable=True
-            queue = await channel.declare_queue('message_check', durable=True)
-            
-            logger.info("Запущен consumer для обработки сообщений")
-            
-            # Асинхронная обработка сообщений
-            async with queue.iterator() as queue_iter:
-                async for message in queue_iter:
-                    async with message.process():
-                        try:
-                            # Обработка сообщения
-                            message_body = message.body.decode()
-                            logger.info(f"Получено сообщение: {message_body}")
-                            
-                            # Разбор сообщения
-                            parts = message_body.split(':', 2)
-                            if len(parts) == 3:
-                                username, msg_text, timestamp = parts
-                                await process_message(username, msg_text, float(timestamp))
-                            else:
-                                logger.warning(f"Неверный формат сообщения: {message_body}")
-                        except Exception as e:
-                            logger.error(f"Ошибка при обработке сообщения из очереди: {e}")
-                            # Продолжаем работу, не прерывая цикл обработки
-    except Exception as e:
-        logger.error(f"Ошибка в consumer: {e}")
-        # Пауза перед повторным подключением
-        await asyncio.sleep(5)
-        # Рекурсивный вызов для перезапуска consumer
-        await consumer()
-
-# Отправка одобренных сообщений
-async def send_approved_message(username: str, message: str):
-    try:
-        # Отправка сообщения в канал
-        await bot.send_message(
-            chat_id=CHANNEL_ID,
-            text=f"Сообщение от @{username}:\n\n{message}"
-        )
-        logger.info(f"Сообщение от {username} отправлено в канал {CHANNEL_ID}")
+        logger.error(f"Ошибка при проверке сообщения пользователя {username}: {e}")
         
-        # Обновление времени последней отправки в базе данных
+        # В случае ошибки сохраняем информацию об ошибке в базе данных
         async with async_session() as session:
             async with session.begin():
                 stmt = select(UserMessage).where(UserMessage.username == username)
                 result = await session.execute(stmt)
-                user_msg = result.scalar_one_or_none()
+                user_message = result.scalar_one_or_none()
                 
-                if user_msg:
-                    user_msg.last_sent = datetime.now()
+                if user_message:
+                    user_message.approved = -1
+                    user_message.check_result = f"❌ Произошла ошибка при проверке резюме: {str(e)}"
                     await session.commit()
-                    logger.info(f"Обновлено время последней отправки для {username}")
-    except Exception as e:
-        logger.error(f"Ошибка при отправке сообщения в канал: {e}")
+
+async def schedule_message_sending(username: str) -> None:
+    """
+    Планирует отправку сообщения в канал.
+    Проверяет, одобрено ли сообщение, и если да, планирует его отправку.
+    
+    Args:
+        username: Имя пользователя
+    """
+    logger.info(f"Планирование отправки сообщения для пользователя {username}")
+    
+    async with async_session() as session:
+        async with session.begin():
+            # Получаем сообщение пользователя из базы данных
+            stmt = select(UserMessage).where(UserMessage.username == username)
+            result = await session.execute(stmt)
+            user_message = result.scalar_one_or_none()
+            
+            if not user_message:
+                logger.warning(f"Сообщение пользователя {username} не найдено в базе данных")
+                return
+            
+            # Проверяем, одобрено ли сообщение
+            if user_message.approved != 1:
+                logger.info(f"Сообщение пользователя {username} не одобрено, отправка не планируется")
+                return
+            
+            # Проверяем, когда сообщение было отправлено в последний раз
+            current_time = datetime.now()
+            
+            if user_message.last_sent:
+                time_since_last_sent = current_time - user_message.last_sent
+                hours_since_last_sent = time_since_last_sent.total_seconds() / 3600
+                
+                if hours_since_last_sent < MESSAGE_INTERVAL_HOURS:
+                    logger.info(f"Сообщение пользователя {username} было отправлено менее {MESSAGE_INTERVAL_HOURS} часов назад, отправка не планируется")
+                    return
+            
+            # Отправляем сообщение в канал
+            try:
+                # Формируем сообщение для отправки в канал
+                channel_message = f"📝 Резюме от @{username}:\n\n{user_message.message}"
+                
+                await bot.send_message(chat_id=CHANNEL_ID, text=channel_message)
+                logger.info(f"Сообщение пользователя {username} отправлено в канал")
+                
+                # Обновляем время последней отправки
+                user_message.last_sent = current_time
+                await session.commit()
+            except Exception as e:
+                logger.error(f"Ошибка при отправке сообщения пользователя {username} в канал: {e}")
 
 @dp.message(Command("start"))
 async def start_command(message: types.Message):
@@ -206,7 +232,10 @@ async def start_command(message: types.Message):
         "📝 Просто отправь мне текст своего резюме с хэштегом #резюме, и я проверю его на соответствие правилам.\n"
         "✅ Если резюме пройдет проверку, оно будет отправляться в канал каждые "
         f"{MESSAGE_INTERVAL_HOURS} часов.\n\n"
-        "⚠️ Важно: Ваше сообщение должно содержать хэштег #резюме и быть правильно оформлено!\n\n"
+        "⚠️ Важно: Ваше резюме должно содержать:\n"
+        "- Хэштег #резюме\n"
+        "- Не менее 20 слов\n"
+        "- Информацию как минимум о двух из следующих разделов: опыт работы, образование, навыки, контакты\n\n"
         "📊 Ты можешь проверить статус своего резюме с помощью команды /status\n\n"
         "📋 Доступные команды:\n"
         "/start - Показать это сообщение\n"
@@ -219,6 +248,9 @@ async def start_command(message: types.Message):
 @dp.message(Command("status"))
 async def status_command(message: types.Message):
     username = message.from_user.username or str(message.from_user.id)
+    # Убираем символ @ из username, если он есть
+    if username.startswith('@'):
+        username = username[1:]
     
     async with async_session() as session:
         stmt = select(UserMessage).where(UserMessage.username == username)
@@ -230,7 +262,10 @@ async def status_command(message: types.Message):
             return
         
         status_text = "📊 Статус вашего сообщения:\n\n"
-        status_text += f"📝 Сообщение: {user_msg.message}\n\n"
+        
+        # Ограничиваем длину сообщения для отображения
+        message_preview = user_msg.message[:100] + "..." if len(user_msg.message) > 100 else user_msg.message
+        status_text += f"📝 Сообщение: {message_preview}\n\n"
         
         if user_msg.approved == 0:
             status_text += "⏳ Статус: На проверке\n"
@@ -256,15 +291,14 @@ async def help_command(message: types.Message):
         "🤖 Этот бот позволяет отправлять резюме в канал после проверки.\n\n"
         "📝 Как использовать бота:\n"
         "1. Отправьте текст резюме боту с хэштегом #резюме\n"
-        "2. Бот проверит резюме с помощью DeepSeek AI на соответствие правилам\n"
+        "2. Бот проверит резюме на соответствие правилам\n"
         "3. Если резюме одобрено, оно будет отправлено в канал\n"
         "4. Одобренные резюме будут отправляться в канал каждые "
         f"{MESSAGE_INTERVAL_HOURS} часов\n\n"
         "❗ Требования к резюме:\n"
-        f"- Минимальная длина сообщения: {MIN_MESSAGE_LENGTH} символов\n"
         "- Резюме должно содержать хэштег #резюме\n"
-        "- Резюме должно быть грамотно составлено (проверяется с помощью DeepSeek AI)\n"
-        "- Резюме не должно содержать запрещенные слова и спам-символы\n\n"
+        "- Резюме должно содержать не менее 20 слов\n"
+        "- Резюме должно содержать информацию как минимум о двух из следующих разделов: опыт работы, образование, навыки, контакты\n\n"
         "📊 Статусы резюме:\n"
         "⏳ На проверке - резюме ожидает проверки\n"
         "✅ Одобрено - резюме прошло проверку и будет отправляться в канал\n"
@@ -282,12 +316,39 @@ async def process_message_handler(message: types.Message):
     if message.text and message.text.startswith('/'):
         return
     
+    # Получаем username пользователя
     username = message.from_user.username or str(message.from_user.id)
-    user_id = message.from_user.id  # Получаем числовой ID
+    # Убираем символ @ из username, если он есть
+    if username.startswith('@'):
+        username = username[1:]
+    
     user_message = message.text
     
     if len(user_message) <= 5:
         await message.answer("❌ Сообщение слишком короткое. Минимальная длина - 6 символов.")
+        return
+    
+    # Проверяем наличие хэштега #резюме
+    if "#резюме" not in user_message.lower():
+        await message.answer(
+            "❌ Сообщение не содержит хэштег #резюме. Пожалуйста, добавьте хэштег #резюме в ваше сообщение.\n\n"
+            "Пример правильного резюме:\n\n"
+            "#резюме\n\n"
+            "Опыт работы: 3 года в разработке ПО\n"
+            "Образование: Высшее техническое\n"
+            "Навыки: Python, JavaScript, SQL\n"
+            "Контакты: email@example.com, @username\n\n"
+            "Важно: Ваше резюме должно содержать как минимум два из следующих разделов:\n"
+            "- Опыт работы\n"
+            "- Образование\n"
+            "- Навыки\n"
+            "- Контакты\n\n"
+            "Ключевые слова, которые помогут системе распознать разделы:\n"
+            "- Опыт: опыт, стаж, работал, работаю, лет опыта, занимался, делал\n"
+            "- Образование: образование, учился, окончил, диплом, курсы, учеба\n"
+            "- Навыки: навыки, умения, владею, знаю, работаю с, использую, умею\n"
+            "- Контакты: контакты, связь, телефон, email, почта, @, тг"
+        )
         return
     
     # Сохраняем сообщение в базе данных
@@ -328,154 +389,30 @@ async def process_message_handler(message: types.Message):
         await message.answer(
             "🔄 Ваше предыдущее сообщение было заменено на новое!\n\n"
             "⏳ Сообщение отправлено на проверку!\n\n"
-            "Вы получите уведомление о результате проверки.\n"
+            "Вы получите результат проверки через команду /status.\n"
             f"Если сообщение будет одобрено, оно будет отправляться в канал каждые {MESSAGE_INTERVAL_HOURS} часов."
         )
     else:
         await message.answer(
             "⏳ Сообщение отправлено на проверку!\n\n"
-            "Вы получите уведомление о результате проверки.\n"
+            "Вы можете проверить статус через команду /status.\n"
             f"Если сообщение будет одобрено, оно будет отправляться в канал каждые {MESSAGE_INTERVAL_HOURS} часов."
         )
 
-# Функция для обработки сообщений из очереди
-async def process_message(username: str, msg_text: str, timestamp: float):
-    try:
-        logger.info(f"Обработка сообщения от пользователя {username} (timestamp: {timestamp})")
-        
-        # Проверяем сообщение
-        approved, check_report = await check_message_with_neural_net(msg_text)
-        logger.info(f"Результат проверки для {username}: {'Одобрено' if approved else 'Отклонено'}")
-        
-        # Обновляем статус в базе данных
-        async with async_session() as session:
-            async with session.begin():
-                stmt = select(UserMessage).where(UserMessage.username == username)
-                result = await session.execute(stmt)
-                user_msg = result.scalar_one_or_none()
-                
-                if user_msg:
-                    # Проверяем, что сообщение в базе данных совпадает с проверенным
-                    # Если не совпадает, значит пользователь отправил новое сообщение
-                    if user_msg.message != msg_text:
-                        logger.warning(f"Сообщение от {username} в базе данных не совпадает с проверенным. Пропускаем обновление статуса.")
-                        return
-                    
-                    # Проверяем, что сообщение не устарело (пользователь мог отправить новое сообщение)
-                    if hasattr(user_msg, 'last_update') and user_msg.last_update:
-                        last_update_timestamp = user_msg.last_update.timestamp()
-                        if last_update_timestamp > timestamp:
-                            logger.warning(f"Сообщение от {username} устарело (timestamp: {timestamp}, last_update: {last_update_timestamp}). Пропускаем обновление статуса.")
-                            return
-                    
-                    user_msg.approved = 1 if approved else -1
-                    user_msg.check_result = check_report
-                    await session.commit()
-                    logger.info(f"Статус сообщения от {username} обновлен в базе данных")
-                else:
-                    logger.warning(f"Пользователь {username} не найден в базе данных")
-                    return
-        
-        # Пытаемся отправить уведомление пользователю
-        try:
-            # Проверяем, является ли username числом (ID пользователя)
-            chat_id = int(username) if username.isdigit() else username
-            
-            if approved:
-                try:
-                    await bot.send_message(
-                        chat_id=chat_id,
-                        text=f"✅ Ваше сообщение прошло проверку и будет отправлено в канал!\n\nРезультаты проверки:\n{check_report}"
-                    )
-                    logger.info(f"Уведомление об одобрении отправлено пользователю {username}")
-                except Exception as e:
-                    logger.error(f"Не удалось отправить уведомление пользователю {username}: {e}")
-                
-                # Отправляем сообщение в канал в любом случае
-                await send_approved_message(username, msg_text)
-                
-                # Планируем повторения каждые MESSAGE_INTERVAL_HOURS часов
-                scheduler.add_job(
-                    send_approved_message,
-                    trigger='interval',
-                    hours=MESSAGE_INTERVAL_HOURS,
-                    start_date=datetime.now() + timedelta(hours=MESSAGE_INTERVAL_HOURS),
-                    args=(username, msg_text),
-                    id=f"msg_{username}",
-                    replace_existing=True
-                )
-                logger.info(f"Запланирована регулярная отправка сообщения от {username}")
-            else:
-                try:
-                    await bot.send_message(
-                        chat_id=chat_id,
-                        text=f"❌ Ваше сообщение не прошло проверку и не будет отправлено.\n\nРезультаты проверки:\n{check_report}\n\nПожалуйста, исправьте сообщение и отправьте снова."
-                    )
-                    logger.info(f"Уведомление об отклонении отправлено пользователю {username}")
-                except Exception as e:
-                    logger.error(f"Не удалось отправить уведомление пользователю {username}: {e}")
-        except Exception as e:
-            logger.error(f"Общая ошибка при обработке сообщения: {e}")
-    except Exception as e:
-        logger.error(f"Критическая ошибка в обработчике сообщений: {e}")
-
-async def restore_scheduled_messages():
-    """Восстанавливает запланированные сообщения из базы данных"""
-    try:
-        logger.info("Восстановление запланированных сообщений...")
-        async with async_session() as session:
-            # Получаем все одобренные сообщения
-            stmt = select(UserMessage).where(UserMessage.approved == 1)
-            result = await session.execute(stmt)
-            approved_messages = result.scalars().all()
-            
-            count = 0
-            for msg in approved_messages:
-                # Планируем отправку сообщения
-                scheduler.add_job(
-                    send_approved_message,
-                    trigger='interval',
-                    hours=MESSAGE_INTERVAL_HOURS,
-                    start_date=datetime.now() + timedelta(minutes=1),  # Начинаем через минуту
-                    args=(msg.username, msg.message),
-                    id=f"msg_{msg.username}",
-                    replace_existing=True
-                )
-                count += 1
-            
-            logger.info(f"Восстановлено {count} запланированных сообщений")
-    except Exception as e:
-        logger.error(f"Ошибка при восстановлении запланированных сообщений: {e}")
-
 async def main():
-    try:
-        # Запускаем безопасную миграцию
-        from safe_migrate import safe_migrate
-        await safe_migrate()
-        logger.info("Безопасная миграция выполнена")
-        
-        # Инициализируем базу данных
-        await init_db()
-        logger.info("База данных инициализирована")
-        
-        # Запускаем планировщик
-        scheduler.start()
-        logger.info("Планировщик запущен")
-        
-        # Запускаем consumer в отдельной задаче
-        consumer_task = asyncio.create_task(consumer())
-        logger.info("Consumer запущен в отдельной задаче")
-        
-        # Восстанавливаем запланированные задачи из базы данных
-        await restore_scheduled_messages()
-        logger.info("Запланированные сообщения восстановлены")
-        
-        # Запускаем бота
-        logger.info("Запускаем бота...")
-        await dp.start_polling(bot)
-    except Exception as e:
-        logger.error(f"Ошибка при запуске бота: {e}")
-        raise
+    """Основная функция запуска бота."""
+    # Инициализируем базу данных
+    await init_db()
+    
+    # Запускаем планировщик
+    scheduler.start()
+    
+    # Запускаем бота
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    )
     asyncio.run(main())

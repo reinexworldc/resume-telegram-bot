@@ -2,7 +2,12 @@ import asyncio
 import logging
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
-from config import DATABASE_URL
+
+# Пытаемся импортировать как модуль, если не получается - используем относительные пути
+try:
+    from src.config import DATABASE_URL
+except ImportError:
+    from config import DATABASE_URL
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
